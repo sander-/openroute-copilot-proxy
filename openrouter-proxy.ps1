@@ -209,6 +209,12 @@ function Handle-Chat {
 
     if ($isStream) {
         # ── Streaming: pipe SSE chunks straight through ────────────────────
+        # Inject stream_options so OpenRouter includes usage in the final chunk
+        $outBody = if ($body -notmatch '"stream_options"') {
+            $body -replace '(?s)\}\s*$', ',"stream_options":{"include_usage":true}}'
+        } else { $body }
+
+        $promptTok = $null; $completionTok = $null
         try {
             $Resp.StatusCode  = 200
             $Resp.ContentType = "text/event-stream; charset=utf-8"
@@ -222,7 +228,7 @@ function Handle-Chat {
                 $http.DefaultRequestHeaders.TryAddWithoutValidation($kv.Key, $kv.Value) | Out-Null
             }
             $reqMsg         = [Net.Http.HttpRequestMessage]::new([Net.Http.HttpMethod]::Post, $uri)
-            $reqMsg.Content = [Net.Http.StringContent]::new($body, [Text.Encoding]::UTF8, "application/json")
+            $reqMsg.Content = [Net.Http.StringContent]::new($outBody, [Text.Encoding]::UTF8, "application/json")
 
             $upResp  = $http.SendAsync($reqMsg, [Net.Http.HttpCompletionOption]::ResponseHeadersRead).GetAwaiter().GetResult()
             $upBytes = $upResp.Content.ReadAsStreamAsync().GetAwaiter().GetResult()
@@ -234,6 +240,12 @@ function Handle-Chat {
                 $line = $reader.ReadLine()
                 $writer.WriteLine($line)
                 if ($DebugOutput) { Log DEBUG "<< $line" }
+                # Capture token counts from usage chunk
+                if ($line -match '"prompt_tokens"\s*:\s*(\d+)')     { $promptTok     = $Matches[1] }
+                if ($line -match '"completion_tokens"\s*:\s*(\d+)') { $completionTok = $Matches[1] }
+            }
+            if ($null -ne $promptTok) {
+                Log INFO "<-- tokens  in=$promptTok  out=$completionTok"
             }
         }
         catch { Log ERROR "Stream error: $_" }
@@ -247,6 +259,9 @@ function Handle-Chat {
         try {
             $result = Invoke-RestMethod -Uri $uri -Method POST -Body $body `
                           -ContentType "application/json" -Headers $headers
+            if ($result.usage) {
+                Log INFO "<-- tokens  in=$($result.usage.prompt_tokens)  out=$($result.usage.completion_tokens)"
+            }
             $json = $result | ConvertTo-Json -Depth 20 -Compress
             Send-Json $Resp 200 $json
         }
@@ -268,7 +283,7 @@ function Handle-Request {
     $method = $req.HttpMethod
     $path   = $req.Url.AbsolutePath.TrimEnd("/")
 
-    Log INFO "$method $path"
+    if ($path -ne "/api/show") { Log INFO "$method $path" }
     if ($DebugOutput) {
         $hdrs = ($req.Headers.AllKeys | ForEach-Object { "${_}=$($req.Headers[$_])" }) -join " | "
         Log DEBUG "Headers: $hdrs"
@@ -325,7 +340,7 @@ function Handle-Request {
                 "`"capabilities`":[`"completion`",`"tools`"]" +
             "}"
 
-            Log INFO "SHOW $modelId"
+            Log INFO "POST /api/show  $modelId"
             Send-Json $resp 200 $showResp
             return
         }
@@ -352,15 +367,44 @@ function Handle-Request {
 # Startup
 # ---------------------------------------------------------------------------
 $prefix   = "http://localhost:$ListenPort/"
-$listener = [Net.HttpListener]::new()
-$listener.Prefixes.Add($prefix)
+$script:listener = [Net.HttpListener]::new()
+$script:listener.Prefixes.Add($prefix)
 
-try { $listener.Start() }
+try { $script:listener.Start() }
 catch {
     Write-Host "ERROR: Cannot bind to $prefix — $_" -ForegroundColor Red
     Write-Host "Try running as Administrator or change -ListenPort" -ForegroundColor Yellow
     exit 1
 }
+
+# Trap Ctrl+C using a compiled C# class. 
+# We must use C# because PowerShell script blocks invoked from OS signal handlers 
+# run on a separate thread that lacks a PowerShell Runspace, causing crashes.
+try { 
+    $null = [CtrlCInterceptor] 
+} catch {
+    Add-Type -TypeDefinition @"
+using System;
+using System.Net;
+
+public static class CtrlCInterceptor {
+    public static HttpListener Listener;
+    public static void OnCancelKeyPress(object sender, ConsoleCancelEventArgs e) {
+        e.Cancel = true; // Prevent immediate process termination
+        try { 
+            if (Listener != null) Listener.Stop(); 
+        } catch {}
+    }
+}
+"@
+}
+
+[CtrlCInterceptor]::Listener = $script:listener
+$cancelEventHandler = [ConsoleCancelEventHandler][CtrlCInterceptor]::OnCancelKeyPress
+[Console]::add_CancelKeyPress($cancelEventHandler)
+
+# Keep the engine event for other exit scenarios (like typing 'exit' in the console)
+$null = Register-EngineEvent -SourceIdentifier PowerShell.Exiting -Action { try { $script:listener.Stop() } catch {} }
 
 Refresh-Models
 
@@ -378,26 +422,26 @@ Write-Host ""
 Write-Host "  Press Ctrl+C to stop." -ForegroundColor DarkGray
 Write-Host ""
 
-$null = Register-EngineEvent -SourceIdentifier PowerShell.Exiting -Action { $listener.Stop() }
-
 # ---------------------------------------------------------------------------
 # Request loop — single-threaded, synchronous.
-# Streaming responses block until complete, which is fine: Copilot sends
-# one request at a time per agent session. If you need true concurrency,
-# a RunspacePool approach is required (see comments below).
 # ---------------------------------------------------------------------------
-while ($listener.IsListening) {
+while ($script:listener.IsListening) {
     try {
-        $ctx = $listener.GetContext()
+        $ctx = $script:listener.GetContext()
     }
     catch [Net.HttpListenerException] {
-        if (-not $listener.IsListening) { break }
+        # Thrown when listener.Stop() is called via Ctrl+C
+        if (-not $script:listener.IsListening) { break }
         Log ERROR "Listener: $_"
         continue
+    }
+    catch [ObjectDisposedException] {
+        # Safety net if the listener is closed while waiting
+        break
     }
     try   { Handle-Request $ctx }
     catch { Log ERROR "Handler: $_"; try { $ctx.Response.OutputStream.Close() } catch {} }
 }
 
-$listener.Close()
+try { $script:listener.Close() } catch {}
 Log INFO "Proxy stopped."

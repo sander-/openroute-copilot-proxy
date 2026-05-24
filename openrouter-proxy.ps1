@@ -5,14 +5,7 @@
 
 .DESCRIPTION
     Listens on the same port/paths as Ollama and forwards all requests to OpenRouter.
-    The /api/tags and /v1/models endpoints return only models that support tool calling.
-
-    Endpoints:
-      GET  /api/version           → {"version":"0.3.0"}
-      GET  /api/tags              → Ollama-shape list of tool-calling models
-      GET  /v1/models             → OpenAI-shape list of tool-calling models
-      POST /api/chat              → forwarded to OpenRouter
-      POST /v1/chat/completions   → forwarded to OpenRouter
+    Uses a Runspace Pool for concurrency and a shared HttpClient to prevent socket exhaustion.
 
     Visual Studio setup:
       Tools → Options → GitHub Copilot → Ollama endpoint
@@ -32,13 +25,6 @@
 
 .PARAMETER DebugOutput
     Print request bodies and SSE chunks to the console.
-
-.EXAMPLE
-    .\CopilotAgentProxy.ps1 -OpenRouterApiKey "sk-or-v1-..."
-
-.EXAMPLE
-    $env:OPENROUTER_API_KEY = "sk-or-v1-..."
-    .\CopilotAgentProxy.ps1 -ModelFilter "anthropic"
 #>
 [CmdletBinding()]
 param(
@@ -58,7 +44,21 @@ if (-not $OpenRouterApiKey) {
 }
 
 # ---------------------------------------------------------------------------
-# Logging — uses [Console] directly so it works from any thread
+# Global Shared Resources
+# ---------------------------------------------------------------------------
+# 1. Shared HttpClient (Prevents socket exhaustion)
+$HttpClient = [Net.Http.HttpClient]::new()
+$HttpClient.Timeout = [TimeSpan]::FromMinutes(15)
+
+# 2. Thread-safe Model Cache
+$ModelCache = [Hashtable]::Synchronized(@{
+    OllamaTags   = '{"models":[]}'
+    OpenAIModels = '{"object":"list","data":[]}'
+    Expiry       = [DateTime]::MinValue
+})
+
+# ---------------------------------------------------------------------------
+# Logging
 # ---------------------------------------------------------------------------
 function Log {
     param([string]$Level, [string]$Msg)
@@ -88,14 +88,12 @@ function Send-Json {
 
 function Send-Err {
     param([System.Net.HttpListenerResponse]$R, [int]$Code=500, [string]$Msg="Error")
-    # Minimal JSON escape for the message
     $escaped = $Msg -replace '\\','\\\\'  -replace '"','\"'  -replace "`n",'\n'  -replace "`r",''
     Send-Json -R $R -Code $Code -Body "{`"error`":{`"message`":`"$escaped`",`"code`":$Code}}"
 }
 
 function Read-Body {
     param([System.Net.HttpListenerRequest]$Req)
-    # ContentLength64 is -1 for chunked transfer encoding — use a MemoryStream in that case
     if ($Req.ContentLength64 -eq 0) { return "" }
     if ($Req.ContentLength64 -gt 0) {
         $buf  = [byte[]]::new($Req.ContentLength64)
@@ -107,25 +105,22 @@ function Read-Body {
         }
         return [Text.Encoding]::UTF8.GetString($buf, 0, $read)
     }
-    # Chunked / unknown length
     $ms = [IO.MemoryStream]::new()
     $Req.InputStream.CopyTo($ms)
     return [Text.Encoding]::UTF8.GetString($ms.ToArray())
 }
 
 # ---------------------------------------------------------------------------
-# Model cache — fetched once, refreshed every 5 min
+# Model cache fetching (Thread-safe)
 # ---------------------------------------------------------------------------
-$script:CachedOllamaTags  = ""   # JSON string for /api/tags
-$script:CachedOpenAIModels = ""  # JSON string for /v1/models
-$script:CacheExpiry        = [DateTime]::MinValue
-
 function Refresh-Models {
-    if ([DateTime]::Now -lt $script:CacheExpiry) { return }
+    if ([DateTime]::Now -lt $ModelCache.Expiry) { return }
 
-    Log INFO "Fetching tool-calling models from OpenRouter…"
+    [System.Threading.Monitor]::Enter($ModelCache)
     try {
-        # Use Invoke-RestMethod on the main thread — it has a full runspace here
+        if ([DateTime]::Now -lt $ModelCache.Expiry) { return } # Double-check lock
+
+        Log INFO "Fetching tool-calling models from OpenRouter…"
         $resp = Invoke-RestMethod -Uri "$OpenRouterUrl/models" `
                     -Headers @{ Authorization = "Bearer $OpenRouterApiKey" } `
                     -Method GET
@@ -136,7 +131,6 @@ function Refresh-Models {
         $nowUnix      = [long][DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
 
         foreach ($m in $resp.data) {
-            # Only keep models with tools in supported_parameters
             $hasTools = $false
             if ($m.supported_parameters) {
                 $hasTools = [bool]($m.supported_parameters | Where-Object { $_ -eq "tools" })
@@ -149,7 +143,6 @@ function Refresh-Models {
             $family = ($id -split "/")[0]
             $ctx    = if ($m.context_length) { "$($m.context_length)ctx" } else { "unknown" }
 
-            # JSON-escape the values
             $jId     = $id     -replace '\\','\\\\'  -replace '"','\"'
             $jFamily = $family -replace '\\','\\\\'  -replace '"','\"'
             $jNow    = $now    -replace '\\','\\\\'  -replace '"','\"'
@@ -167,23 +160,22 @@ function Refresh-Models {
             )
         }
 
-        $script:CachedOllamaTags   = "{`"models`":[" + ($ollamaModels -join ",") + "]}"
-        $script:CachedOpenAIModels = "{`"object`":`"list`",`"data`":[" + ($openaiModels -join ",") + "]}"
-        $script:CacheExpiry        = [DateTime]::Now.AddMinutes(5)
+        $ModelCache.OllamaTags   = "{`"models`":[" + ($ollamaModels -join ",") + "]}"
+        $ModelCache.OpenAIModels = "{`"object`":`"list`",`"data`":[" + ($openaiModels -join ",") + "]}"
+        $ModelCache.Expiry       = [DateTime]::Now.AddMinutes(5)
 
         Log INFO "Cached $($ollamaModels.Count) tool-calling models$(if($ModelFilter){" (filter: *$ModelFilter*)"})"
     }
     catch {
         Log WARN "Failed to fetch models: $_"
-        if (-not $script:CachedOllamaTags) {
-            $script:CachedOllamaTags   = '{"models":[]}'
-            $script:CachedOpenAIModels = '{"object":"list","data":[]}'
-        }
+    }
+    finally {
+        [System.Threading.Monitor]::Exit($ModelCache)
     }
 }
 
 # ---------------------------------------------------------------------------
-# Chat forwarder — called synchronously on the main loop thread
+# Chat forwarder (Handles Cancellation & Shared HttpClient)
 # ---------------------------------------------------------------------------
 function Handle-Chat {
     param([System.Net.HttpListenerRequest]$Req, [System.Net.HttpListenerResponse]$Resp)
@@ -192,7 +184,6 @@ function Handle-Chat {
     if (-not $body) { Send-Err $Resp 400 "Empty body"; return }
     if ($DebugOutput) { Log DEBUG "REQ >> $body" }
 
-    # Extract model and stream flag cheaply with regex (avoids Json library issues)
     $modelMatch  = [regex]::Match($body, '"model"\s*:\s*"([^"]+)"')
     $streamMatch = [regex]::Match($body, '"stream"\s*:\s*(true|false)')
     $model    = if ($modelMatch.Success)  { $modelMatch.Groups[1].Value  } else { "openai/gpt-4o" }
@@ -208,13 +199,13 @@ function Handle-Chat {
     $uri = "$OpenRouterUrl/chat/completions"
 
     if ($isStream) {
-        # ── Streaming: pipe SSE chunks straight through ────────────────────
-        # Inject stream_options so OpenRouter includes usage in the final chunk
         $outBody = if ($body -notmatch '"stream_options"') {
             $body -replace '(?s)\}\s*$', ',"stream_options":{"include_usage":true}}'
         } else { $body }
 
         $promptTok = $null; $completionTok = $null
+        $cts = [Threading.CancellationTokenSource]::new()
+        
         try {
             $Resp.StatusCode  = 200
             $Resp.ContentType = "text/event-stream; charset=utf-8"
@@ -223,24 +214,33 @@ function Handle-Chat {
             $Resp.Headers.Add("Connection","keep-alive")
             $Resp.SendChunked = $true
 
-            $http    = [Net.Http.HttpClient]::new()
-            foreach ($kv in $headers.GetEnumerator()) {
-                $http.DefaultRequestHeaders.TryAddWithoutValidation($kv.Key, $kv.Value) | Out-Null
-            }
             $reqMsg         = [Net.Http.HttpRequestMessage]::new([Net.Http.HttpMethod]::Post, $uri)
             $reqMsg.Content = [Net.Http.StringContent]::new($outBody, [Text.Encoding]::UTF8, "application/json")
+            
+            # Attach headers directly to the message (Thread-safe for Runspace Pool)
+            foreach ($kv in $headers.GetEnumerator()) {
+                $reqMsg.Headers.TryAddWithoutValidation($kv.Key, $kv.Value) | Out-Null
+            }
 
-            $upResp  = $http.SendAsync($reqMsg, [Net.Http.HttpCompletionOption]::ResponseHeadersRead).GetAwaiter().GetResult()
+            $task   = $HttpClient.SendAsync($reqMsg, [Net.Http.HttpCompletionOption]::ResponseHeadersRead, $cts.Token)
+            $upResp = $task.GetAwaiter().GetResult()
             $upBytes = $upResp.Content.ReadAsStreamAsync().GetAwaiter().GetResult()
             $reader  = [IO.StreamReader]::new($upBytes)
             $writer  = [IO.StreamWriter]::new($Resp.OutputStream, [Text.Encoding]::UTF8)
             $writer.AutoFlush = $true
 
             while (-not $reader.EndOfStream) {
+                # Stop Generating support: Abort if client disconnects
+                if (-not $Resp.OutputStream.CanWrite) {
+                    Log WARN "Client disconnected. Aborting OpenRouter stream."
+                    $cts.Cancel()
+                    break
+                }
+
                 $line = $reader.ReadLine()
                 $writer.WriteLine($line)
                 if ($DebugOutput) { Log DEBUG "<< $line" }
-                # Capture token counts from usage chunk
+                
                 if ($line -match '"prompt_tokens"\s*:\s*(\d+)')     { $promptTok     = $Matches[1] }
                 if ($line -match '"completion_tokens"\s*:\s*(\d+)') { $completionTok = $Matches[1] }
             }
@@ -248,14 +248,22 @@ function Handle-Chat {
                 Log INFO "<-- tokens  in=$promptTok  out=$completionTok"
             }
         }
-        catch { Log ERROR "Stream error: $_" }
+        catch [System.IO.IOException] {
+            Log WARN "Client closed connection mid-stream."
+            $cts.Cancel()
+        }
+        catch [System.Threading.Tasks.TaskCanceledException] {
+            # Expected when $cts.Cancel() is called
+        }
+        catch { 
+            Log ERROR "Stream error: $_" 
+        }
         finally {
+            try { $cts.Dispose() } catch {}
             try { $Resp.OutputStream.Close() } catch {}
-            try { $http.Dispose()            } catch {}
         }
     }
     else {
-        # ── Non-streaming ─────────────────────────────────────────────────
         try {
             $result = Invoke-RestMethod -Uri $uri -Method POST -Body $body `
                           -ContentType "application/json" -Headers $headers
@@ -290,7 +298,6 @@ function Handle-Request {
     }
 
     if ($method -eq "OPTIONS") { Send-Json $resp 204 ""; return }
-    # Also handle HEAD — return same headers as GET but no body
     if ($method -eq "HEAD") {
         $resp.StatusCode = 200
         $resp.Headers.Add("Access-Control-Allow-Origin","*")
@@ -300,17 +307,14 @@ function Handle-Request {
 
     switch ($path) {
         "/api/version"          { Send-Json $resp 200 '{"version":"0.3.0"}'; return }
-        "/api/tags"             { Refresh-Models; Send-Json $resp 200 $script:CachedOllamaTags;   return }
-        "/api/ps"               { Send-Json $resp 200 '{"models":[]}'; return }   # running models
-                "/api/show"             {
-            # Copilot calls this for each model to get its capabilities.
-            # We return a minimal but valid Ollama /api/show response.
+        "/api/tags"             { Refresh-Models; Send-Json $resp 200 $ModelCache.OllamaTags;   return }
+        "/api/ps"               { Send-Json $resp 200 '{"models":[]}'; return }
+        "/api/show"             {
             $showBody = Read-Body $req
             $modelId  = ""
             $m = [regex]::Match($showBody, '"model"\s*:\s*"([^"]+)"')
             if ($m.Success) { $modelId = $m.Groups[1].Value }
             
-            # Properly escape backslashes and double quotes for JSON using single quotes
             $jId     = $modelId -replace '\\','\\\\' -replace '"','\"'
             $family  = ($modelId -split "/")[0]
             $jFamily = $family   -replace '\\','\\\\' -replace '"','\"'
@@ -344,27 +348,18 @@ function Handle-Request {
             Send-Json $resp 200 $showResp
             return
         }
-        "/v1/models"            { Refresh-Models; Send-Json $resp 200 $script:CachedOpenAIModels; return }
+        "/v1/models"            { Refresh-Models; Send-Json $resp 200 $ModelCache.OpenAIModels; return }
         "/api/chat"             { Handle-Chat $req $resp; return }
         "/v1/chat/completions"  { Handle-Chat $req $resp; return }
         default {
-            # Dump the full request so we can see exactly what Copilot is asking for
             Log WARN "UNHANDLED $method $path"
-            try {
-                $headers = ($req.Headers.AllKeys | ForEach-Object { "  ${_}: $($req.Headers[$_])" }) -join "`n"
-                Log WARN "Headers:`n$headers"
-                if ($req.ContentLength64 -gt 0) {
-                    $b = Read-Body $req
-                    Log WARN "Body: $b"
-                }
-            } catch {}
             Send-Err $resp 404 "Unknown: $path"
         }
     }
 }
 
 # ---------------------------------------------------------------------------
-# Startup
+# Startup & Concurrency Setup
 # ---------------------------------------------------------------------------
 $prefix   = "http://localhost:$ListenPort/"
 $script:listener = [Net.HttpListener]::new()
@@ -377,36 +372,46 @@ catch {
     exit 1
 }
 
-# Trap Ctrl+C using a compiled C# class. 
-# We must use C# because PowerShell script blocks invoked from OS signal handlers 
-# run on a separate thread that lacks a PowerShell Runspace, causing crashes.
-try { 
-    $null = [CtrlCInterceptor] 
-} catch {
+# Trap Ctrl+C using a compiled C# class to avoid Runspace threading issues
+try { $null = [CtrlCInterceptor] } catch {
     Add-Type -TypeDefinition @"
 using System;
 using System.Net;
-
 public static class CtrlCInterceptor {
     public static HttpListener Listener;
     public static void OnCancelKeyPress(object sender, ConsoleCancelEventArgs e) {
-        e.Cancel = true; // Prevent immediate process termination
-        try { 
-            if (Listener != null) Listener.Stop(); 
-        } catch {}
+        e.Cancel = true;
+        try { if (Listener != null) Listener.Stop(); } catch {}
     }
 }
 "@
 }
-
 [CtrlCInterceptor]::Listener = $script:listener
 $cancelEventHandler = [ConsoleCancelEventHandler][CtrlCInterceptor]::OnCancelKeyPress
 [Console]::add_CancelKeyPress($cancelEventHandler)
 
-# Keep the engine event for other exit scenarios (like typing 'exit' in the console)
-$null = Register-EngineEvent -SourceIdentifier PowerShell.Exiting -Action { try { $script:listener.Stop() } catch {} }
+# Setup Runspace Pool for Concurrency
+$iss = [initialsessionstate]::CreateDefault()
+$customFunctions = @('Log', 'Send-Json', 'Send-Err', 'Read-Body', 'Refresh-Models', 'Handle-Chat', 'Handle-Request')
+foreach ($fname in $customFunctions) {
+    $f = Get-Command $fname -ErrorAction SilentlyContinue
+    if ($f) {
+        $iss.Commands.Add([System.Management.Automation.Runspaces.SessionStateFunctionEntry]::new($f.Name, $f.Definition))
+    }
+}
+# Inject variables into Runspaces
+$iss.Variables.Add([System.Management.Automation.Runspaces.SessionStateVariableEntry]::new("OpenRouterApiKey", $OpenRouterApiKey, ""))
+$iss.Variables.Add([System.Management.Automation.Runspaces.SessionStateVariableEntry]::new("OpenRouterUrl", $OpenRouterUrl, ""))
+$iss.Variables.Add([System.Management.Automation.Runspaces.SessionStateVariableEntry]::new("ModelFilter", $ModelFilter, ""))
+$iss.Variables.Add([System.Management.Automation.Runspaces.SessionStateVariableEntry]::new("DebugOutput", $DebugOutput, ""))
+$iss.Variables.Add([System.Management.Automation.Runspaces.SessionStateVariableEntry]::new("ListenPort", $ListenPort, ""))
+$iss.Variables.Add([System.Management.Automation.Runspaces.SessionStateVariableEntry]::new("HttpClient", $HttpClient, ""))
+$iss.Variables.Add([System.Management.Automation.Runspaces.SessionStateVariableEntry]::new("ModelCache", $ModelCache, ""))
 
-Refresh-Models
+$runspacePool = [runspacefactory]::CreateRunspacePool(1, 10, $iss, $Host)
+$runspacePool.Open()
+
+$jobs = [System.Collections.Generic.List[psobject]]::new()
 
 Write-Host ""
 Write-Host "╔═══════════════════════════════════════════════════════════╗" -ForegroundColor Green
@@ -423,25 +428,47 @@ Write-Host "  Press Ctrl+C to stop." -ForegroundColor DarkGray
 Write-Host ""
 
 # ---------------------------------------------------------------------------
-# Request loop — single-threaded, synchronous.
+# Main Request Loop
 # ---------------------------------------------------------------------------
 while ($script:listener.IsListening) {
+    # Clean up completed background jobs
+    $completed = $jobs | Where-Object { $_.Handle.IsCompleted }
+    foreach ($job in $completed) {
+        try { $job.PS.EndInvoke($job.Handle) } catch {}
+        $job.PS.Dispose()
+        $jobs.Remove($job)
+    }
+
     try {
         $ctx = $script:listener.GetContext()
     }
     catch [Net.HttpListenerException] {
-        # Thrown when listener.Stop() is called via Ctrl+C
         if (-not $script:listener.IsListening) { break }
-        Log ERROR "Listener: $_"
         continue
     }
-    catch [ObjectDisposedException] {
-        # Safety net if the listener is closed while waiting
-        break
-    }
-    try   { Handle-Request $ctx }
-    catch { Log ERROR "Handler: $_"; try { $ctx.Response.OutputStream.Close() } catch {} }
+    catch [ObjectDisposedException] { break }
+
+    # Hand off request to Runspace Pool
+    $ps = [powershell]::Create()
+    $ps.RunspacePool = $runspacePool
+    $null = $ps.AddScript({
+        param($Ctx)
+        Handle-Request -Ctx $Ctx
+    }).AddArgument($ctx)
+    
+    $handle = $ps.BeginInvoke()
+    $jobs.Add([pscustomobject]@{ PS = $ps; Handle = $handle })
 }
 
+# ---------------------------------------------------------------------------
+# Cleanup on Exit
+# ---------------------------------------------------------------------------
+foreach ($job in $jobs) {
+    try { $job.PS.Stop() } catch {}
+    try { $job.PS.Dispose() } catch {}
+}
+try { $runspacePool.Close() } catch {}
+try { $runspacePool.Dispose() } catch {}
+try { $HttpClient.Dispose() } catch {}
 try { $script:listener.Close() } catch {}
 Log INFO "Proxy stopped."

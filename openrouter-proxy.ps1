@@ -186,8 +186,11 @@ function Handle-Chat {
 
     $modelMatch  = [regex]::Match($body, '"model"\s*:\s*"([^"]+)"')
     $streamMatch = [regex]::Match($body, '"stream"\s*:\s*(true|false)')
-    $model    = if ($modelMatch.Success)  { $modelMatch.Groups[1].Value  } else { "openai/gpt-4o" }
-    $isStream = if ($streamMatch.Success) { $streamMatch.Groups[1].Value -eq "true" } else { $false }
+    $model    = "openai/gpt-4o"
+    if ($modelMatch.Success) { $model = $modelMatch.Groups[1].Value }
+
+    $isStream = $false
+    if ($streamMatch.Success) { $isStream = ($streamMatch.Groups[1].Value -eq "true") }
 
     Log INFO "--> OpenRouter  model=$model  stream=$isStream"
 
@@ -199,9 +202,10 @@ function Handle-Chat {
     $uri = "$OpenRouterUrl/chat/completions"
 
     if ($isStream) {
-        $outBody = if ($body -notmatch '"stream_options"') {
-            $body -replace '(?s)\}\s*$', ',"stream_options":{"include_usage":true}}'
-        } else { $body }
+        $outBody = $body
+        if ($body -notmatch '"stream_options"') {
+            $outBody = $body -replace '(?s)\}\s*$', ',"stream_options":{"include_usage":true}}'
+        }
 
         $promptTok = $null; $completionTok = $null
         $cts = [Threading.CancellationTokenSource]::new()
@@ -434,9 +438,9 @@ while ($script:listener.IsListening) {
     # Clean up completed background jobs
     $completed = $jobs | Where-Object { $_.Handle.IsCompleted }
     foreach ($job in $completed) {
-        try { $job.PS.EndInvoke($job.Handle) } catch {}
+        try { $null = $job.PS.EndInvoke($job.Handle) } catch {}
         $job.PS.Dispose()
-        $jobs.Remove($job)
+        $null = $jobs.Remove($job)   
     }
 
     try {

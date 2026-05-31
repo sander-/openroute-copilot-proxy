@@ -226,8 +226,34 @@ function Handle-Chat {
                 $reqMsg.Headers.TryAddWithoutValidation($kv.Key, $kv.Value) | Out-Null
             }
 
-            $task   = $HttpClient.SendAsync($reqMsg, [Net.Http.HttpCompletionOption]::ResponseHeadersRead, $cts.Token)
-            $upResp = $task.GetAwaiter().GetResult()
+            # Add 30-second timeout for initial connection
+            $timeoutCts = [Threading.CancellationTokenSource]::new([TimeSpan]::FromSeconds(30))
+            try {
+                $task   = $HttpClient.SendAsync($reqMsg, [Net.Http.HttpCompletionOption]::ResponseHeadersRead, $timeoutCts.Token)
+                $delayTask = [Threading.Tasks.Task]::Delay([TimeSpan]::FromSeconds(30), $timeoutCts.Token)
+                $completedTask = [Threading.Tasks.Task]::WhenAny($task, $delayTask).GetAwaiter().GetResult()
+
+                if ($completedTask -eq $delayTask) {
+                    $timeoutCts.Cancel()
+                    Log ERROR "Upstream timeout after 30 seconds (stream)"
+                    Send-Err $Resp 504 "Upstream did not respond within 30 seconds"
+                    return
+                }
+
+                $upResp = $task.GetAwaiter().GetResult()
+            }
+            finally {
+                $timeoutCts.Dispose()
+            }
+
+            # Check if upstream returned an error
+            if (-not $upResp.IsSuccessStatusCode) {
+                $errorBody = $upResp.Content.ReadAsStringAsync().GetAwaiter().GetResult()
+                Log ERROR "Upstream error: $($upResp.StatusCode) - $errorBody"
+                Send-Err $Resp ([int]$upResp.StatusCode) $errorBody
+                return
+            }
+
             $upBytes = $upResp.Content.ReadAsStreamAsync().GetAwaiter().GetResult()
             $reader  = [IO.StreamReader]::new($upBytes)
             $writer  = [IO.StreamWriter]::new($Resp.OutputStream, [Text.Encoding]::UTF8)
@@ -256,11 +282,12 @@ function Handle-Chat {
             Log WARN "Client closed connection mid-stream."
             $cts.Cancel()
         }
-        catch [System.Threading.Tasks.TaskCanceledException] {
-            # Expected when $cts.Cancel() is called
+        catch [System.OperationCanceledException] {
+            # Handles both OperationCanceledException and TaskCanceledException (which inherits from it)
+            Log ERROR "Upstream timeout or cancelled"
         }
-        catch { 
-            Log ERROR "Stream error: $_" 
+        catch {
+            Log ERROR "Stream error: $_"
         }
         finally {
             try { $cts.Dispose() } catch {}
@@ -269,13 +296,67 @@ function Handle-Chat {
     }
     else {
         try {
-            $result = Invoke-RestMethod -Uri $uri -Method POST -Body $body `
-                          -ContentType "application/json" -Headers $headers
-            if ($result.usage) {
-                Log INFO "<-- tokens  in=$($result.usage.prompt_tokens)  out=$($result.usage.completion_tokens)"
+            # Use HttpClient with 30-second timeout for non-streaming requests
+            $reqMsg         = [Net.Http.HttpRequestMessage]::new([Net.Http.HttpMethod]::Post, $uri)
+            $reqMsg.Content = [Net.Http.StringContent]::new($body, [Text.Encoding]::UTF8, "application/json")
+            foreach ($kv in $headers.GetEnumerator()) {
+                $reqMsg.Headers.TryAddWithoutValidation($kv.Key, $kv.Value) | Out-Null
             }
-            $json = $result | ConvertTo-Json -Depth 20 -Compress
-            Send-Json $Resp 200 $json
+
+            $timeoutCts = [Threading.CancellationTokenSource]::new([TimeSpan]::FromSeconds(30))
+            try {
+                $task = $HttpClient.SendAsync($reqMsg, $timeoutCts.Token)
+                $delayTask = [Threading.Tasks.Task]::Delay([TimeSpan]::FromSeconds(30), $timeoutCts.Token)
+                $completedTask = [Threading.Tasks.Task]::WhenAny($task, $delayTask).GetAwaiter().GetResult()
+
+                if ($completedTask -eq $delayTask) {
+                    $timeoutCts.Cancel()
+                    Log ERROR "Upstream timeout after 30 seconds"
+                    Send-Err $Resp 504 "Upstream did not respond within 30 seconds"
+                    return
+                }
+
+                $upResp = $task.GetAwaiter().GetResult()
+            }
+            finally {
+                $timeoutCts.Dispose()
+            }
+
+            # Check if upstream returned an error
+            if (-not $upResp.IsSuccessStatusCode) {
+                $errorBody = $upResp.Content.ReadAsStringAsync().GetAwaiter().GetResult()
+                Log ERROR "Upstream error: $($upResp.StatusCode) - $errorBody"
+                Send-Err $Resp ([int]$upResp.StatusCode) $errorBody
+                return
+            }
+
+            $upBytes = $upResp.Content.ReadAsStreamAsync().GetAwaiter().GetResult()
+            $reader  = [IO.StreamReader]::new($upBytes)
+            $writer  = [IO.StreamWriter]::new($Resp.OutputStream, [Text.Encoding]::UTF8)
+            $writer.AutoFlush = $true
+
+            while (-not $reader.EndOfStream) {
+                # Stop Generating support: Abort if client disconnects
+                if (-not $Resp.OutputStream.CanWrite) {
+                    Log WARN "Client disconnected. Aborting OpenRouter stream."
+                    $cts.Cancel()
+                    break
+                }
+
+                $line = $reader.ReadLine()
+                $writer.WriteLine($line)
+                if ($DebugOutput) { Log DEBUG "<< $line" }
+                
+                if ($line -match '"prompt_tokens"\s*:\s*(\d+)')     { $promptTok     = $Matches[1] }
+                if ($line -match '"completion_tokens"\s*:\s*(\d+)') { $completionTok = $Matches[1] }
+            }
+            if ($null -ne $promptTok) {
+                Log INFO "<-- tokens  in=$promptTok  out=$completionTok"
+            }
+        }
+        catch [System.OperationCanceledException] {
+            Log ERROR "Upstream timeout after 30 seconds"
+            Send-Err $Resp 504 "Upstream did not respond within 30 seconds"
         }
         catch {
             Log ERROR "OpenRouter error: $_"
